@@ -2,14 +2,18 @@
 
 {.push raises: [].}
 
-import chronicles, chronos, results, sets
+import chronicles, chronos, results, sets, tables
 import libp2p/multistream
 import libp2p/peerid
+import libp2p/peerstore
+import libp2p/crypto/crypto
 import libp2p/protocols/protocol
 import libp2p/stream/bufferstream
 import libp2p/stream/connection
 import libp2p/utils/opt
 import libp2p_mix
+import libp2p_mix/[pool, multiaddr]
+import ./address/parse
 import ./[connect_attempts, reply_credentials, sessions, streams, trace, wire]
 
 logScope:
@@ -48,6 +52,7 @@ type
 
   MixTransport* = ref object
     mix: MixProtocol
+    addressDestinations: Table[PeerId, MixPubInfo]
     surbSender: SurbSender
     replyCredentials: ReplyCredentialStore
     sessions: SessionStore
@@ -119,6 +124,7 @@ proc publishSessionEvent(
 proc removeAndShutdownSession(
     self: MixTransport, session: TransportSession
 ) {.async: (raises: [CancelledError]).} =
+  self.addressDestinations.del(session.sessionId)
   discard self.sessions.remove(session.sessionId)
   discard self.replyCredentials.removeSession(session.sessionId)
   await session.shutdown()
@@ -240,6 +246,42 @@ proc waitForReplySurbs(
       await session.waitForReplyCapacityStateChange()
   ok()
 
+proc sendToDestination(
+    self: MixTransport, destination: PeerId, sessionId: PeerId, payload: seq[byte]
+): Future[Result[void, string]].Raising([CancelledError]) {.gcsafe, raises: [].} =
+  if sessionId notin self.addressDestinations:
+    return
+      self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, payload)
+  # MixNodePool reads these three entries from the switch's peer store. Override
+  # only this destination, including its preferred address, for route creation.
+  # pool.add/remove would leave address/key changes behind and might select a
+  # previously observed address instead of the supplied candidate.
+  template temporarilySet(bookType, value: untyped) =
+    let book = self.mix.switch.peerStore[bookType]
+    let existed = destination in book.book
+    let previous = book.book.getOrDefault(destination)
+    # Do not publish discovery events for these temporary routing entries:
+    # change handlers could start unrelated flows while the entry is present.
+    book.book[destination] = value
+    defer:
+      if existed:
+        book.book[destination] = previous
+      else:
+        book.book.del(destination)
+
+  let info = self.addressDestinations.getOrDefault(sessionId)
+  temporarilySet(MixPubKeyBook, info.mixPubKey)
+  temporarilySet(KeyBook, PublicKey(scheme: Secp256k1, skkey: info.libp2pPubKey))
+  temporarilySet(LastSeenOutboundBook, Opt.some(info.multiAddr))
+  # Chronos starts send eagerly; Mix finishes route construction before its
+  # first await (sendPacket). All entries are restored before this future is
+  # returned, so no unrelated flow can select the temporary peer as a relay.
+  self.mix.send(MixDestination.exitNode(destination), MixTransportCodec, payload)
+
+  # FIXME this whole thing is a brittle hack. Ideally Mix should provide a
+  #   proper API for sending to a destination without requiring insertion into
+  #   MixNodePool.
+
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
@@ -254,11 +296,7 @@ proc sendStreamFrame(
     traceOutbound(frame)
     let destination = session.destination.valueOr:
       return err("initiator session has no destination")
-    (
-      await self.mix.send(
-        MixDestination.exitNode(destination), MixTransportCodec, payload
-      )
-    ).isOkOr:
+    (await self.sendToDestination(destination, session.sessionId, payload)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
   of SessionRole.Recipient:
     await session.acquireReplySend()
@@ -288,9 +326,7 @@ proc sendTeardownFrame(
     let destination = session.destination.valueOr:
       return false
     return (
-      await noCancel self.mix.send(
-        MixDestination.exitNode(destination), MixTransportCodec, payload
-      )
+      await noCancel self.sendToDestination(destination, session.sessionId, payload)
     ).isOk
   of SessionRole.Recipient:
     if session.receivedSurbCount < DefaultReplySurbRedundancy:
@@ -1082,16 +1118,27 @@ proc createConnectFrame(
   ok(frame)
 
 proc connectInternal(
-    self: MixTransport, destination: PeerId
+    self: MixTransport,
+    destination: PeerId,
+    info: Opt[MixPubInfo] = Opt.none(MixPubInfo),
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+  info.withValue(value):
+    # The address codec is transport-independent. Enforce the underlying Mix
+    # packet format's capabilities here, before installing routing information.
+    discard multiAddrToBytes(destination, value.multiAddr).valueOr:
+      return err("unsupported Mix destination address: " & error)
   let sessionId = PeerId.random(self.mix.switch.rng).valueOr:
     return err("could not generate session identifier: " & $error)
   let session = self.sessions.addInitiatorSession(destination, sessionId).valueOr:
     return err(error)
 
+  info.withValue(value):
+    self.addressDestinations[sessionId] = value
+
   var keepSession = false
   defer:
     if not keepSession:
+      self.addressDestinations.del(sessionId)
       discard self.sessions.remove(sessionId)
       discard self.replyCredentials.removeSession(sessionId)
 
@@ -1101,11 +1148,7 @@ proc connectInternal(
     return err("could not encode Connect frame: " & error)
 
   traceOutbound(frame)
-  (
-    await self.mix.send(
-      MixDestination.exitNode(destination), MixTransportCodec, payload
-    )
-  ).isOkOr:
+  (await self.sendToDestination(destination, session.sessionId, payload)).isOkOr:
     return err("could not send Connect frame: " & error)
 
   let suppliedCount = frame.surbs.len - DefaultReplySurbRedundancy
@@ -1123,30 +1166,80 @@ proc connectInternal(
   await self.publishSessionEvent(session, SessionEventKind.Established)
   ok(session)
 
+proc getExisting(
+    self: MixTransport, destination: PeerId
+): Opt[TransportSession] {.nimcall, gcsafe.} =
+  self.sessions.getByDestination(destination).withValue(existing):
+    if existing.state == SessionState.Established:
+      return Opt.some(existing)
+  return Opt.none(TransportSession)
+
+proc connect*(
+    self: MixTransport, destination: PeerId, addrs: seq[MultiAddress]
+): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+  if not self.started:
+    return err("MixTransport is not started")
+
+  var
+    candidates: seq[MixPubInfo]
+    lastError = "no usable mix address"
+  for address in addrs:
+    let mixinfo = MixPubInfo.fromMixAddress(destination, address).valueOr:
+      lastError = error
+      continue
+    candidates.add(mixinfo)
+
+  if addrs.len > 0 and candidates.len == 0:
+    return err(lastError)
+
+  let withMixInfo: ConnectOperation[PeerId, TransportSession] = proc(
+      destination: PeerId
+  ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
+    var failure: string
+    for candidate in candidates:
+      let attempt = await self.connectInternal(destination, Opt.some(candidate))
+      if attempt.isOk:
+        return attempt
+      failure = attempt.error
+    return err(failure)
+
+  let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
+    p: PeerId
+  ): Opt[TransportSession] =
+    getExisting(self, p)
+
+  trace "connect requested", destination
+  let (session, existing) = (
+    await self.connectAttempts.connect(destination, withMixInfo, paGetExisting)
+  ).valueOr:
+    return err(error)
+
+  if existing and session.state == SessionState.Established:
+    await self.publishSessionEvent(session, SessionEventKind.Established)
+
+  ok(session)
+
 proc connect*(
     self: MixTransport, destination: PeerId
 ): Future[Result[TransportSession, string]] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return err("MixTransport is not started")
 
-  let operation: ConnectOperation[PeerId, TransportSession] = proc(
+  let withPeerId: ConnectOperation[PeerId, TransportSession] = proc(
       destination: PeerId
   ): Future[Result[TransportSession, string]] {.
       async: (raw: true, raises: [CancelledError])
   .} =
     self.connectInternal(destination)
 
-  let getExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
-      destination: PeerId
-  ): Opt[TransportSession] {.gcsafe, raises: [].} =
-    self.sessions.getByDestination(destination).withValue(existing):
-      if existing.state == SessionState.Established:
-        return Opt.some(existing)
-    return Opt.none(TransportSession)
+  let paGetExisting: ExistingConnectionLookup[PeerId, TransportSession] = proc(
+    p: PeerId
+  ): Opt[TransportSession] =
+    getExisting(self, p)
 
   trace "connect requested", destination
   let (session, existing) = (
-    await self.connectAttempts.connect(destination, operation, getExisting)
+    await self.connectAttempts.connect(destination, withPeerId, paGetExisting)
   ).valueOr:
     return err(error)
 
@@ -1156,7 +1249,7 @@ proc connect*(
   ok(session)
 
 proc dial*(
-    self: MixTransport, destination: PeerId, codec: string
+    self: MixTransport, destination: PeerId, addrs: seq[MultiAddress], codec: string
 ): Future[Result[TransportStream, string]] {.async: (raises: [CancelledError]).} =
   if not self.started:
     return err("MixTransport is not started")
@@ -1165,7 +1258,7 @@ proc dial*(
   if codec.len > MaxCodecBytes:
     return err("stream codec is too long")
 
-  let session = (await self.connect(destination)).valueOr:
+  let session = (await self.connect(destination, addrs)).valueOr:
     return err(error)
   let stream = session.addOutboundStream(codec).valueOr:
     return err(error)
@@ -1215,11 +1308,7 @@ proc dial*(
     return err("could not encode OpenStream frame: " & error)
 
   traceOutbound(frame)
-  (
-    await self.mix.send(
-      MixDestination.exitNode(destination), MixTransportCodec, payload
-    )
-  ).isOkOr:
+  (await self.sendToDestination(destination, session.sessionId, payload)).isOkOr:
     return err("could not send OpenStream frame: " & error)
 
   keepReplyCredentials = true
@@ -1238,6 +1327,11 @@ proc dial*(
   self.configureStream(session, stream)
   keepStream = true
   ok(stream)
+
+proc dial*(
+    self: MixTransport, destination: PeerId, codec: string
+): Future[Result[TransportStream, string]] {.async: (raises: [CancelledError]).} =
+  await self.dial(destination, @[], codec)
 
 proc disconnect*(
     self: MixTransport, session: TransportSession
